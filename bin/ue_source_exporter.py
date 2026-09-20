@@ -121,12 +121,15 @@ def run_unreal_batch(arguments: argparse.Namespace, output: Path, assets: list[s
     return process.returncode, read_json(output / report_name, {"assets": [], "textures": []})
 
 
-def shrink_texture_files(output: Path, maximum: int) -> list[dict[str, Any]]:
+def shrink_texture_files(output: Path, maximum: int, relative_paths: list[str] | None = None) -> list[dict[str, Any]]:
     """Cap exported PNGs outside UE, preserving source channel data first."""
     results: list[dict[str, Any]] = []
     if maximum <= 0:
         return results
-    for path in sorted((output / "textures").glob("*.png")) if (output / "textures").is_dir() else []:
+    candidates = [output / relative for relative in relative_paths] if relative_paths is not None else (sorted((output / "textures").glob("*.png")) if (output / "textures").is_dir() else [])
+    for path in candidates:
+        if not path.is_file():
+            continue
         probe = subprocess.run(["magick", "identify", "-format", "%w %h %[channels]", str(path)], text=True, capture_output=True)
         values = probe.stdout.split()
         entry = {"output": str(path.relative_to(output)), "status": "unchanged"}
@@ -168,6 +171,7 @@ def run(arguments: argparse.Namespace) -> int:
         return 0
     exit_codes: list[int] = []
     texture_entries: dict[str, dict[str, Any]] = {}
+    texture_resize: list[dict[str, Any]] = []
     for index, asset_batch in enumerate(batches(pending, arguments.batch_size), 1):
         exit_code, report = run_unreal_batch(arguments, output, asset_batch, index)
         exit_codes.append(exit_code)
@@ -176,9 +180,10 @@ def run(arguments: argparse.Namespace) -> int:
             entries[entry.get("asset", "")] = entry
         for texture in report.get("textures", []):
             texture_entries[texture.get("asset", texture.get("output", ""))] = texture
+        if arguments.textures:
+            texture_resize.extend(shrink_texture_files(output, arguments.max_texture_size, [str(item.get("output", "")) for item in report.get("textures", [])]))
     for entry in entries.values():
         entry["output_root"] = str(output)
-    texture_resize = shrink_texture_files(output, arguments.max_texture_size) if arguments.textures else []
     manifest = make_manifest(requested, entries, list(texture_entries.values()), exit_codes, arguments.batch_size, arguments.textures, texture_resize)
     (output / REPORT_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
