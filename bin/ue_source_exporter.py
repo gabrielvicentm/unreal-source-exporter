@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -81,6 +82,106 @@ def glb_semantic_digest(path: Path) -> str:
         start = view.get("byteOffset", 0)
         digest.update(binary[start:start + view["byteLength"]])
     return digest.hexdigest()
+
+
+def _read_glb(path: Path) -> tuple[dict[str, Any], bytes]:
+    data = path.read_bytes()
+    json_size, json_type = struct.unpack_from("<I4s", data, 12)
+    if json_type != b"JSON":
+        raise ValueError("GLB has no JSON chunk")
+    json_start = 20
+    json_end = json_start + json_size
+    binary_size, binary_type = struct.unpack_from("<I4s", data, json_end)
+    if binary_type != b"BIN\0":
+        raise ValueError("GLB has no binary chunk")
+    binary = data[json_end + 8:json_end + 8 + binary_size]
+    return json.loads(data[json_start:json_end]), binary
+
+
+def _write_glb(path: Path, document: dict[str, Any], binary: bytes) -> None:
+    encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((4 - len(encoded) % 4) % 4)
+    binary += b"\0" * ((4 - len(binary) % 4) % 4)
+    contents = b"glTF" + struct.pack("<II", 2, 12 + 8 + len(encoded) + 8 + len(binary))
+    contents += struct.pack("<I4s", len(encoded), b"JSON") + encoded
+    contents += struct.pack("<I4s", len(binary), b"BIN\0") + binary
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(contents)
+    temporary.replace(path)
+
+
+def _texture_index(document: dict[str, Any], uri: str) -> int:
+    images = document.setdefault("images", [])
+    textures = document.setdefault("textures", [])
+    image_index = next((index for index, image in enumerate(images) if image.get("uri") == uri), None)
+    if image_index is None:
+        image_index = len(images)
+        images.append({"uri": uri})
+    existing = next((index for index, texture in enumerate(textures) if texture.get("source") == image_index), None)
+    if existing is not None:
+        return existing
+    textures.append({"source": image_index})
+    return len(textures) - 1
+
+
+def _material_candidates(slot: dict[str, Any]) -> set[str]:
+    material = str(slot.get("material", ""))
+    return {str(slot.get("slot_name", "")).lower(), material.rsplit("/", 1)[-1].split(".", 1)[0].lower()}
+
+
+def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    """Attach separately exported PNGs to a GLB through standard glTF PBR URIs."""
+    glb = output / str(entry.get("output", ""))
+    if not glb.is_file():
+        return {"asset": entry.get("asset"), "status": "missing_glb"}
+    document, binary = _read_glb(glb)
+    material_targets = {str(material.get("name", "")).lower(): material for material in document.get("materials", [])}
+    changed = 0
+    for slot in entry.get("materials", []):
+        candidates = _material_candidates(slot)
+        targets = [material for name, material in material_targets.items() if name in candidates]
+        if not targets and len(document.get("materials", [])) == 1:
+            targets = document["materials"]
+        if not targets:
+            continue
+        role_textures: dict[str, int] = {}
+        for texture in slot.get("textures", []):
+            texture_file = output / str(texture.get("output", ""))
+            if not texture_file.is_file():
+                continue
+            uri = os.path.relpath(texture_file, glb.parent).replace(os.sep, "/")
+            role = str(texture.get("role", ""))
+            role_textures.setdefault(role, _texture_index(document, uri))
+        for material in targets:
+            pbr = material.setdefault("pbrMetallicRoughness", {})
+            if "albedo" in role_textures:
+                pbr["baseColorTexture"] = {"index": role_textures["albedo"]}
+            if "packed" in role_textures:
+                pbr["metallicRoughnessTexture"] = {"index": role_textures["packed"]}
+                material["occlusionTexture"] = {"index": role_textures["packed"]}
+            if "normal" in role_textures:
+                material["normalTexture"] = {"index": role_textures["normal"]}
+            if "emission" in role_textures:
+                material["emissiveTexture"] = {"index": role_textures["emission"]}
+            if role_textures:
+                changed += 1
+    if changed:
+        _write_glb(glb, document, binary)
+    return {"asset": entry.get("asset"), "status": "bound" if changed else "no_matching_material", "materials": changed}
+
+
+def bind_textures(arguments: argparse.Namespace) -> int:
+    output = Path(arguments.output).expanduser().resolve()
+    entries: dict[str, dict[str, Any]] = {}
+    for report_path in sorted(output.glob("ue_source_export_batch_*.json")):
+        for entry in read_json(report_path, {}).get("assets", []):
+            if entry.get("status") == "exported":
+                entries[entry.get("asset", "")] = entry
+    result = {"assets": [bind_asset_textures(output, entry) for entry in entries.values()]}
+    result["bound"] = sum(item["status"] == "bound" for item in result["assets"])
+    (output / "ue_source_texture_binding.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result["bound"] else 1
 
 
 def read_json(path: Path, fallback: Any) -> Any:
@@ -254,6 +355,8 @@ def main() -> int:
     stage.add_argument("--manifest", required=True)
     stage.add_argument("--godot-project", required=True)
     stage.add_argument("--destination", required=True, help="Relative path, e.g. assets_runtime/_staging/castle.")
+    binding = subcommands.add_parser("bind-textures", help="Attach exported PNGs to GLBs with standard glTF PBR references.")
+    binding.add_argument("--output", required=True)
     arguments = parser.parse_args()
     if arguments.command == "run" and (arguments.batch_size < 1 or arguments.max_texture_size < 0):
         parser.error("--batch-size must be positive and --max-texture-size cannot be negative")
@@ -261,7 +364,9 @@ def main() -> int:
         return run(arguments)
     if arguments.command == "compare":
         return compare(arguments)
-    return stage_godot(arguments)
+    if arguments.command == "stage-godot":
+        return stage_godot(arguments)
+    return bind_textures(arguments)
 
 
 if __name__ == "__main__":
