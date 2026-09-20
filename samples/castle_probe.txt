@@ -1,0 +1,11 @@
+# Dez meshes pequenos e variados do Medieval Castle para a primeira prova.
+/Game/Medieval_Castle/Meshes/Stone/SM_Rock_01
+/Game/Medieval_Castle/Meshes/Stone/SM_Rock_02
+/Game/Medieval_Castle/Meshes/Props/SM_Amphorae01_LOD0
+/Game/Medieval_Castle/Meshes/Props/SM_Arrow
+/Game/Medieval_Castle/Meshes/Vegetation/SM_BroadLeave
+/Game/Medieval_Castle/Meshes/Vegetation/SM_Bush01_A_LOD0
+/Game/Medieval_Castle/Meshes/Stone/SM_Rock_03
+/Game/Medieval_Castle/Meshes/Castle/Building_Modules/SM_Bridge_Seg01_LOD0
+/Game/Medieval_Castle/Meshes/Castle/Building_Modules/SM_Castle_BLD_Door_a_LOD0
+/Game/Medieval_Castle/Meshes/Castle/Building_Modules/SM_Castle_BLD_Floor_a_LOD0
