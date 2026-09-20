@@ -157,6 +157,28 @@ def _material_candidates(slot: dict[str, Any]) -> set[str]:
     return {str(slot.get("slot_name", "")).lower(), material.rsplit("/", 1)[-1].split(".", 1)[0].lower()}
 
 
+def _prune_unreferenced_images(document: dict[str, Any]) -> None:
+    """Drop stale external image URIs left by an earlier binding pass."""
+    refs: list[dict[str, Any]] = []
+    for material in document.get("materials", []):
+        pbr = material.get("pbrMetallicRoughness", {})
+        for value in (pbr.get("baseColorTexture"), pbr.get("metallicRoughnessTexture"), material.get("normalTexture"), material.get("occlusionTexture"), material.get("emissiveTexture")):
+            if isinstance(value, dict) and "index" in value:
+                refs.append(value)
+    old_textures = document.get("textures", [])
+    used_textures = sorted({int(value["index"]) for value in refs})
+    texture_map = {old: new for new, old in enumerate(used_textures)}
+    for value in refs:
+        value["index"] = texture_map[int(value["index"])]
+    document["textures"] = [old_textures[index] for index in used_textures]
+    old_images = document.get("images", [])
+    used_images = sorted({int(texture["source"]) for texture in document["textures"]})
+    image_map = {old: new for new, old in enumerate(used_images)}
+    for texture in document["textures"]:
+        texture["source"] = image_map[int(texture["source"])]
+    document["images"] = [old_images[index] for index in used_images]
+
+
 def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
     """Attach separately exported PNGs to a GLB through standard glTF PBR URIs."""
     glb = output / str(entry.get("output", ""))
@@ -200,6 +222,7 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             if role_textures:
                 changed += 1
     if changed:
+        _prune_unreferenced_images(document)
         _write_glb(glb, document, binary)
     return {"asset": entry.get("asset"), "status": "bound" if changed else "no_matching_material", "materials": changed}
 
