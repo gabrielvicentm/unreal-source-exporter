@@ -102,6 +102,8 @@ def _write_glb(path: Path, document: dict[str, Any], binary: bytes) -> None:
     encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     encoded += b" " * ((4 - len(encoded) % 4) % 4)
     binary += b"\0" * ((4 - len(binary) % 4) % 4)
+    if document.get("buffers"):
+        document["buffers"][0]["byteLength"] = len(binary)
     contents = b"glTF" + struct.pack("<II", 2, 12 + 8 + len(encoded) + 8 + len(binary))
     contents += struct.pack("<I4s", len(encoded), b"JSON") + encoded
     contents += struct.pack("<I4s", len(binary), b"BIN\0") + binary
@@ -122,6 +124,32 @@ def _texture_index(document: dict[str, Any], uri: str) -> int:
         return existing
     textures.append({"source": image_index})
     return len(textures) - 1
+
+
+def _embedded_texture(document: dict[str, Any], binary: bytes, texture_file: Path) -> tuple[int, bytes]:
+    """Put a PNG in the GLB binary chunk so Godot never needs an external URI."""
+    key = "wave_texture_" + hashlib.sha256(str(texture_file.resolve()).encode("utf-8")).hexdigest()[:16]
+    images = document.setdefault("images", [])
+    textures = document.setdefault("textures", [])
+    image_index = next((index for index, image in enumerate(images) if image.get("name") == key), None)
+    if image_index is None:
+        image_index = len(images)
+        images.append({"name": key})
+    texture_index = next((index for index, texture in enumerate(textures) if texture.get("source") == image_index), None)
+    if texture_index is None:
+        textures.append({"source": image_index})
+        texture_index = len(textures) - 1
+    image = document["images"][image_index]
+    if "bufferView" in image:
+        return texture_index, binary
+    payload = texture_file.read_bytes()
+    binary += b"\0" * ((4 - len(binary) % 4) % 4)
+    offset = len(binary)
+    binary += payload
+    document.setdefault("bufferViews", []).append({"buffer": 0, "byteOffset": offset, "byteLength": len(payload)})
+    image.clear()
+    image.update({"name": key, "bufferView": len(document["bufferViews"]) - 1, "mimeType": "image/png"})
+    return texture_index, binary
 
 
 def _material_candidates(slot: dict[str, Any]) -> set[str]:
@@ -155,9 +183,9 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             texture_file = output / str(texture.get("output", ""))
             if not texture_file.is_file():
                 continue
-            uri = os.path.relpath(texture_file, glb.parent).replace(os.sep, "/")
             role = str(texture.get("role", ""))
-            role_textures.setdefault(role, _texture_index(document, uri))
+            if role not in role_textures:
+                role_textures[role], binary = _embedded_texture(document, binary, texture_file)
         for material in targets:
             pbr = material.setdefault("pbrMetallicRoughness", {})
             if "albedo" in role_textures:
