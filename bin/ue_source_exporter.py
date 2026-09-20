@@ -137,9 +137,15 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
     document, binary = _read_glb(glb)
     material_targets = {str(material.get("name", "")).lower(): material for material in document.get("materials", [])}
     changed = 0
-    for slot in entry.get("materials", []):
+    slots = entry.get("materials", [])
+    for slot_index, slot in enumerate(slots):
         candidates = _material_candidates(slot)
         targets = [material for name, material in material_targets.items() if name in candidates]
+        if not targets and len(document.get("materials", [])) == len(slots):
+            # UE sometimes writes unnamed glTF materials. In that case glTF keeps
+            # the StaticMesh material-slot order, which is safer than guessing by
+            # a shared material name.
+            targets = [document["materials"][slot_index]]
         if not targets and len(document.get("materials", [])) == 1:
             targets = document["materials"]
         if not targets:
