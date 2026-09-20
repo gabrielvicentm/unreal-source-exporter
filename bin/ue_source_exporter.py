@@ -91,6 +91,13 @@ def _read_glb(path: Path) -> tuple[dict[str, Any], bytes]:
         raise ValueError("GLB has no JSON chunk")
     json_start = 20
     json_end = json_start + json_size
+    if json_end == len(data):
+        # GLB permits a JSON-only file.  This occurs for a few Unreal assets
+        # that initially have no mesh buffer, but it can still receive image
+        # data when we bind exported textures below.
+        return json.loads(data[json_start:json_end]), b""
+    if json_end + 8 > len(data):
+        raise ValueError("GLB chunk header is truncated")
     binary_size, binary_type = struct.unpack_from("<I4s", data, json_end)
     if binary_type != b"BIN\0":
         raise ValueError("GLB has no binary chunk")
@@ -143,6 +150,9 @@ def _embedded_texture(document: dict[str, Any], binary: bytes, texture_file: Pat
     if "bufferView" in image:
         return texture_index, binary
     payload = texture_file.read_bytes()
+    buffers = document.setdefault("buffers", [])
+    if not buffers:
+        buffers.append({"byteLength": len(binary)})
     binary += b"\0" * ((4 - len(binary) % 4) % 4)
     offset = len(binary)
     binary += payload

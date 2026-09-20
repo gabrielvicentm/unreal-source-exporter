@@ -22,6 +22,14 @@ def write_glb(path: Path, document: dict, binary: bytes = b"") -> None:
     path.write_bytes(contents)
 
 
+def write_json_only_glb(path: Path, document: dict) -> None:
+    payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    payload += b" " * ((4 - len(payload) % 4) % 4)
+    contents = b"glTF" + struct.pack("<II", 2, 12 + 8 + len(payload))
+    contents += struct.pack("<I4s", len(payload), b"JSON") + payload
+    path.write_bytes(contents)
+
+
 class HostTests(unittest.TestCase):
     def test_selection_rejects_non_game_path_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -57,6 +65,23 @@ class HostTests(unittest.TestCase):
             self.assertNotIn("/Game/Mesh", EXPORTER.existing_successes(root, True))
             output.write_bytes(b"broken")
             self.assertNotIn("/Game/Mesh", EXPORTER.existing_successes(root, False))
+
+    def test_texture_binding_accepts_json_only_glb(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            texture = root / "albedo.png"
+            texture.write_bytes(b"png-data")
+            glb = root / "asset.glb"
+            write_json_only_glb(glb, {"asset": {"version": "2.0"}, "materials": [{"name": "wall"}]})
+            result = EXPORTER.bind_asset_textures(root, {
+                "asset": "/Game/Wall",
+                "output": "asset.glb",
+                "materials": [{"slot_name": "wall", "textures": [{"role": "albedo", "output": "albedo.png"}]}],
+            })
+            self.assertEqual(result["status"], "bound")
+            document, binary = EXPORTER._read_glb(glb)
+            self.assertEqual(document["images"][0]["mimeType"], "image/png")
+            self.assertEqual(binary, b"png-data")
 
 
 if __name__ == "__main__":
