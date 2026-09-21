@@ -66,6 +66,24 @@ class HostTests(unittest.TestCase):
             output.write_bytes(b"broken")
             self.assertNotIn("/Game/Mesh", EXPORTER.existing_successes(root, False))
 
+    def test_resume_uses_completed_batch_after_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "Mesh.glb"
+            write_glb(output, {"asset": {"version": "2.0"}, "meshes": [{}]})
+            batch = {"assets": [{"asset": "/Game/Mesh", "status": "exported", "kind": "static_mesh", "output": "Mesh.glb"}]}
+            job = {"export_textures": True}
+            (root / "ue_source_export_batch_001.json").write_text(json.dumps(batch), encoding="utf-8")
+            (root / "ue_source_export_job_001.json").write_text(json.dumps(job), encoding="utf-8")
+            self.assertIn("/Game/Mesh", EXPORTER.existing_successes(root, True))
+
+    def test_next_batch_index_follows_existing_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ue_source_export_batch_007.json").write_text("{}", encoding="utf-8")
+            (root / "ue_source_export_batch_invalid.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(EXPORTER.next_batch_index(root), 8)
+
     def test_texture_binding_accepts_json_only_glb(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -259,21 +259,42 @@ def read_json(path: Path, fallback: Any) -> Any:
 
 
 def existing_successes(output: Path, require_textures: bool) -> dict[str, dict[str, Any]]:
-    """Return only previous successes whose GLB still passes validation."""
+    """Return only previous successes whose GLB still passes validation.
+
+    A completed run writes a consolidated manifest, but an interrupted run only
+    has its per-batch reports. Read both so a restart does not needlessly redo
+    already validated geometry.
+    """
     manifest = read_json(output / REPORT_NAME, {})
-    if require_textures and not manifest.get("textures_requested"):
+    batch_reports = [read_json(path, {}) for path in sorted(output.glob("ue_source_export_batch_*.json"))]
+    batch_jobs = [read_json(path, {}) for path in sorted(output.glob("ue_source_export_job_*.json"))]
+    textures_requested = bool(manifest.get("textures_requested")) or any(
+        bool(job.get("export_textures")) for job in batch_jobs
+    )
+    if require_textures and not textures_requested:
         return {}
     successes: dict[str, dict[str, Any]] = {}
-    for entry in manifest.get("assets", []):
-        if entry.get("status") != "exported" or not entry.get("output"):
-            continue
-        if validate_glb(output / entry["output"], entry.get("kind")) is None:
-            successes[entry.get("asset", "")] = entry
+    for report in [manifest] + batch_reports:
+        for entry in report.get("assets", []):
+            if entry.get("status") != "exported" or not entry.get("output"):
+                continue
+            if validate_glb(output / entry["output"], entry.get("kind")) is None:
+                successes[entry.get("asset", "")] = entry
     return successes
 
 
 def batches(values: list[str], size: int) -> list[list[str]]:
     return [values[index:index + size] for index in range(0, len(values), size)]
+
+
+def next_batch_index(output: Path) -> int:
+    """Keep resumed jobs from overwriting reports needed by texture binding."""
+    indices: list[int] = []
+    for report_path in output.glob("ue_source_export_batch_*.json"):
+        suffix = report_path.stem.removeprefix("ue_source_export_batch_")
+        if suffix.isdigit():
+            indices.append(int(suffix))
+    return max(indices, default=0) + 1
 
 
 def run_unreal_batch(arguments: argparse.Namespace, output: Path, assets: list[str], index: int) -> tuple[int, dict[str, Any]]:
@@ -340,7 +361,7 @@ def run(arguments: argparse.Namespace) -> int:
     exit_codes: list[int] = []
     texture_entries: dict[str, dict[str, Any]] = {}
     texture_resize: list[dict[str, Any]] = []
-    for index, asset_batch in enumerate(batches(pending, arguments.batch_size), 1):
+    for index, asset_batch in enumerate(batches(pending, arguments.batch_size), next_batch_index(output)):
         exit_code, report = run_unreal_batch(arguments, output, asset_batch, index)
         exit_codes.append(exit_code)
         for entry in report.get("assets", []):
