@@ -164,7 +164,23 @@ def _embedded_texture(document: dict[str, Any], binary: bytes, texture_file: Pat
 
 def _material_candidates(slot: dict[str, Any]) -> set[str]:
     material = str(slot.get("material", ""))
-    return {str(slot.get("slot_name", "")).lower(), material.rsplit("/", 1)[-1].split(".", 1)[0].lower()}
+    return {
+        candidate for candidate in (
+            str(slot.get("slot_name", "")).lower(),
+            material.rsplit("/", 1)[-1].split(".", 1)[0].lower(),
+        ) if candidate
+    }
+
+
+def _primitive_material_order(document: dict[str, Any]) -> list[int]:
+    """Return the GLB material index used by each exported surface in order."""
+    result: list[int] = []
+    for mesh in document.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            index = primitive.get("material")
+            if isinstance(index, int):
+                result.append(index)
+    return result
 
 
 def _prune_unreferenced_images(document: dict[str, Any]) -> None:
@@ -196,11 +212,20 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
         return {"asset": entry.get("asset"), "status": "missing_glb"}
     document, binary = _read_glb(glb)
     material_targets = {str(material.get("name", "")).lower(): material for material in document.get("materials", [])}
+    ordered_indices = _primitive_material_order(document)
     changed = 0
     slots = entry.get("materials", [])
     for slot_index, slot in enumerate(slots):
         candidates = _material_candidates(slot)
         targets = [material for name, material in material_targets.items() if name in candidates]
+        if not targets and slot_index < len(ordered_indices):
+            # Material baking disabled by NullRHI often leaves materials unnamed.
+            # A SkeletalMesh can also reuse one material for two slots (for
+            # example, left/right eyes), so comparing material and slot counts
+            # is not enough. glTF preserves primitive/surface order.
+            index = ordered_indices[slot_index]
+            if 0 <= index < len(document.get("materials", [])):
+                targets = [document["materials"][index]]
         if not targets and len(document.get("materials", [])) == len(slots):
             # UE sometimes writes unnamed glTF materials. In that case glTF keeps
             # the StaticMesh material-slot order, which is safer than guessing by
@@ -216,7 +241,7 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             if not texture_file.is_file():
                 continue
             role = str(texture.get("role", ""))
-            if role not in role_textures:
+            if role in ("albedo", "packed", "normal", "emission") and role not in role_textures:
                 role_textures[role], binary = _embedded_texture(document, binary, texture_file)
         for material in targets:
             pbr = material.setdefault("pbrMetallicRoughness", {})
@@ -237,16 +262,27 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
     return {"asset": entry.get("asset"), "status": "bound" if changed else "no_matching_material", "materials": changed}
 
 
-def bind_textures(arguments: argparse.Namespace) -> int:
-    output = Path(arguments.output).expanduser().resolve()
+def binding_entries_from_reports(output: Path) -> dict[str, dict[str, Any]]:
+    """Read every completed batch so resumed exports can bind old PNGs too."""
     entries: dict[str, dict[str, Any]] = {}
     for report_path in sorted(output.glob("ue_source_export_batch_*.json")):
         for entry in read_json(report_path, {}).get("assets", []):
             if entry.get("status") == "exported":
                 entries[entry.get("asset", "")] = entry
+    return entries
+
+
+def bind_entries(output: Path, entries: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Bind available source textures and persist an auditable result."""
     result = {"assets": [bind_asset_textures(output, entry) for entry in entries.values()]}
     result["bound"] = sum(item["status"] == "bound" for item in result["assets"])
     (output / "ue_source_texture_binding.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return result
+
+
+def bind_textures(arguments: argparse.Namespace) -> int:
+    output = Path(arguments.output).expanduser().resolve()
+    result = bind_entries(output, binding_entries_from_reports(output))
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["bound"] else 1
 
@@ -374,6 +410,12 @@ def run(arguments: argparse.Namespace) -> int:
     for entry in entries.values():
         entry["output_root"] = str(output)
     manifest = make_manifest(requested, entries, list(texture_entries.values()), exit_codes, arguments.batch_size, arguments.textures, texture_resize)
+    if arguments.textures:
+        # NullRHI cannot compile/bake many MaterialInstance graphs. Bind their
+        # raw source PNGs after geometry export instead, so the normal export
+        # command produces a ready-to-import GLB without asking the user to run
+        # a second command or turn on a graphical RHI.
+        manifest["texture_binding"] = bind_entries(output, binding_entries_from_reports(output))
     (output / REPORT_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     return 0 if manifest["passed"] else 1
@@ -432,7 +474,7 @@ def main() -> int:
     command.add_argument("--output", required=True)
     command.add_argument("--batch-size", type=int, default=3)
     command.add_argument("--animations", action=argparse.BooleanOptionalAction, default=True)
-    command.add_argument("--textures", action=argparse.BooleanOptionalAction, default=False, help="Export source PNGs separately; never enables material baking.")
+    command.add_argument("--textures", action=argparse.BooleanOptionalAction, default=True, help="Export and embed source PNGs by default; never enables material baking. Use --no-textures for geometry only.")
     command.add_argument("--max-texture-size", type=int, default=2048, help="Host-side cap for exported PNGs; 0 keeps source resolution.")
     command.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     command.add_argument("--dry-run", action="store_true")

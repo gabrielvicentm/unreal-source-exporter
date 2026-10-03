@@ -14,7 +14,8 @@ descartável com `NullRHI`.
 - uma lista externa de paths `/Game/...`, um por linha;
 - `StaticMesh`, `SkeletalMesh`, `AnimSequence` e `FoliageType` que referencia
   uma `StaticMesh`;
-- GLB com malha, skeleton e animação quando a Unreal conseguir exportá-los;
+- GLB com malha, skeleton, animação e texturas PBR-fonte quando a Unreal
+  conseguir exportá-los;
 - parâmetros PBR nomeados, texturas-fonte e colisões registrados no manifest;
 - três assets por processo, reinício entre lotes, logs por lote e retomada;
 - validação estrutural de cada GLB; uma saída incompleta nunca vira sucesso.
@@ -40,15 +41,16 @@ python3 bin/ue_source_exporter.py run \
   --unreal-cmd /home/gh/UE5.8.2/Engine/Binaries/Linux/UnrealEditor-Cmd \
   --project '/caminho/Projeto.uproject' \
   --selection /caminho/selecao.txt \
-  --textures --max-texture-size 2048 \
+  --max-texture-size 2048 \
   --output /caminho/wave_source/exports/nome_do_bundle
 ```
 
-O modo padrão usa `NullRHI`, exporta animações e retoma apenas GLBs já validados.
-`--textures` é deliberadamente opcional: ele exporta PNGs-fonte separados em
-`textures/`, sem bake, e o processo host reduz somente as cópias exportadas ao
-limite indicado. O `.uasset` original nunca é alterado. Use `0` para conservar
-a resolução integral; use `2048` como padrão seguro para importação no Godot.
+O modo padrão usa `NullRHI`, exporta animações, extrai PNGs-fonte separados em
+`textures/` e os embute no GLB com os slots PBR padrão. Assim, Material Instances
+que ficariam brancas sem uma GPU passam a carregar albedo, normal, ORM e emissão
+sem material bake. O `.uasset` original nunca é alterado. Use `--no-textures`
+somente para uma exportação de geometria; use `0` para conservar a resolução
+integral e `2048` como padrão seguro para importação no Godot.
 Para verificar a seleção sem abrir a Unreal, acrescente `--dry-run`. Para uma
 máquina mais fraca, mantenha `--batch-size 3` ou reduza para `1`. Não use
 `--with-rhi` como tentativa de corrigir uma falha; ele existe somente para

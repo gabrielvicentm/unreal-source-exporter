@@ -57,15 +57,21 @@ def _texture_output(asset_path):
 
 def _texture_role(parameter_name, asset_path):
     value = "{} {}".format(parameter_name, asset_path).lower()
-    if any(token in value for token in ("normal", "_n", " n_")):
+    # Check the important semantic words before abbreviations: the "rma" in
+    # "BaseColor Map" is not an RMA map.
+    if any(token in value for token in ("basecolor", "base_color", "albedo", "diffuse")):
+        return "albedo"
+    if "normal" in value:
         return "normal"
-    if any(token in value for token in ("orm", "rma", "mra", "rough", "metal", "ao", "occlusion", "mask")):
-        return "packed"
     if any(token in value for token in ("emiss", "glow")):
         return "emission"
     if any(token in value for token in ("opacity", "alpha")):
         return "opacity"
-    return "albedo"
+    if any(token in value for token in ("occlusionroughnessmetallic", "roughnessmetallic", "_orm", " orm", "_rma", " rma", "_mra", " mra")):
+        return "packed"
+    # Detail, blood, dirt, ID, parallax and subsurface maps belong to the
+    # original graph but cannot be safely substituted for a PBR base map.
+    return "auxiliary"
 
 
 def _scalar_role(name):

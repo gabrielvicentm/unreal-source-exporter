@@ -101,6 +101,32 @@ class HostTests(unittest.TestCase):
             self.assertEqual(document["images"][0]["mimeType"], "image/png")
             self.assertEqual(binary, b"png-data")
 
+    def test_texture_binding_uses_surface_order_when_nullrhi_omits_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("body", "eye"):
+                (root / (name + ".png")).write_bytes((name + "-png").encode())
+            glb = root / "asset.glb"
+            write_glb(glb, {
+                "asset": {"version": "2.0"},
+                "materials": [{"pbrMetallicRoughness": {}}, {"pbrMetallicRoughness": {}}],
+                "meshes": [{"primitives": [{"material": 0}, {"material": 1}, {"material": 1}]}],
+            })
+            result = EXPORTER.bind_asset_textures(root, {
+                "asset": "/Game/Knight",
+                "output": "asset.glb",
+                "materials": [
+                    {"slot_name": "body", "textures": [{"role": "albedo", "output": "body.png"}]},
+                    {"slot_name": "eye_left", "textures": [{"role": "albedo", "output": "eye.png"}]},
+                    {"slot_name": "eye_right", "textures": [{"role": "albedo", "output": "eye.png"}]},
+                ],
+            })
+            self.assertEqual(result["status"], "bound")
+            document, _binary = EXPORTER._read_glb(glb)
+            self.assertEqual(len(document["images"]), 2)
+            self.assertIn("baseColorTexture", document["materials"][0]["pbrMetallicRoughness"])
+            self.assertIn("baseColorTexture", document["materials"][1]["pbrMetallicRoughness"])
+
 
 if __name__ == "__main__":
     unittest.main()
