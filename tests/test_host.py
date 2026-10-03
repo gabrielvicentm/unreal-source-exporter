@@ -127,6 +127,27 @@ class HostTests(unittest.TestCase):
             self.assertIn("baseColorTexture", document["materials"][0]["pbrMetallicRoughness"])
             self.assertIn("baseColorTexture", document["materials"][1]["pbrMetallicRoughness"])
 
+    def test_udim_atlas_combines_horizontal_tiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The files need not be real PNGs here: mock the ImageMagick call
+            # so the host-side naming and layout rules are independently tested.
+            canonical = root / "revolver.png"
+            for tile in (1001, 1002):
+                (root / "revolver.{}.png".format(tile)).write_bytes(b"tile")
+            original = EXPORTER.subprocess.run
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"atlas")
+                return type("Completed", (), {"returncode": 0, "stderr": ""})()
+            EXPORTER.subprocess.run = fake_run
+            try:
+                result = EXPORTER.prepare_udim_atlas(canonical, 1024)
+            finally:
+                EXPORTER.subprocess.run = original
+            self.assertEqual(result["status"], "udim_atlas")
+            self.assertEqual(result["columns"], 2)
+            self.assertEqual(canonical.read_bytes(), b"atlas")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -162,6 +163,54 @@ def _embedded_texture(document: dict[str, Any], binary: bytes, texture_file: Pat
     return texture_index, binary
 
 
+def _udim_tiles(texture_file: Path) -> list[tuple[int, Path]]:
+    """Find Unreal's PNG exports for a missing `<name>.1001.png` UDIM set."""
+    prefix = texture_file.stem + "."
+    result: list[tuple[int, Path]] = []
+    for candidate in texture_file.parent.glob(texture_file.stem + ".*" + texture_file.suffix):
+        suffix = candidate.name.removeprefix(prefix).removesuffix(texture_file.suffix)
+        if re.fullmatch(r"[1-9][0-9]{3}", suffix):
+            result.append((int(suffix), candidate))
+    return sorted(result)
+
+
+def prepare_udim_atlas(texture_file: Path, maximum: int = 0) -> dict[str, Any] | None:
+    """Join one horizontal UDIM row into the canonical texture path.
+
+    Unreal writes virtual textures as `<name>.1001.png`, `<name>.1002.png`,
+    while glTF has no portable UDIM convention. The current Wave revolver uses
+    exactly that two-tile horizontal layout. The caller later divides U by the
+    number of columns so the atlas samples the same texels.
+    """
+    tiles = _udim_tiles(texture_file)
+    if not tiles:
+        return None
+    rows = {(tile - 1001) // 10 for tile, _path in tiles}
+    columns = [(tile - 1001) % 10 for tile, _path in tiles]
+    if len(rows) != 1 or set(columns) != set(range(max(columns) + 1)):
+        return {"output": str(texture_file), "status": "unsupported_udim_layout", "tiles": [str(path) for _tile, path in tiles]}
+    ordered = [next(path for tile, path in tiles if (tile - 1001) % 10 == column) for column in range(max(columns) + 1)]
+    temporary = texture_file.with_name(texture_file.stem + ".udim_tmp.png")
+    command = ["magick", *map(str, ordered), "+append"]
+    if maximum > 0:
+        command += ["-resize", "{}x{}>".format(maximum, maximum)]
+    command.append(str(temporary))
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode:
+        return {"output": str(texture_file), "status": "udim_atlas_failed", "error": completed.stderr.strip()}
+    temporary.replace(texture_file)
+    return {"output": str(texture_file), "status": "udim_atlas", "columns": len(ordered), "tiles": [str(path) for path in ordered]}
+
+
+def _udim_columns(texture_file: Path) -> int:
+    tiles = _udim_tiles(texture_file)
+    if not tiles:
+        return 1
+    rows = {(tile - 1001) // 10 for tile, _path in tiles}
+    columns = {(tile - 1001) % 10 for tile, _path in tiles}
+    return max(columns) + 1 if len(rows) == 1 and columns == set(range(max(columns) + 1)) else 1
+
+
 def _material_candidates(slot: dict[str, Any]) -> set[str]:
     material = str(slot.get("material", ""))
     return {
@@ -181,6 +230,36 @@ def _primitive_material_order(document: dict[str, Any]) -> list[int]:
             if isinstance(index, int):
                 result.append(index)
     return result
+
+
+def _scale_accessor_u(document: dict[str, Any], binary: bytes, accessor_index: int, columns: int, visited: set[int]) -> bytes:
+    """Remap TEXCOORD_0 from horizontal UDIM space to a horizontal atlas."""
+    if columns <= 1 or accessor_index in visited:
+        return binary
+    accessors = document.get("accessors", [])
+    if not (0 <= accessor_index < len(accessors)):
+        return binary
+    accessor = accessors[accessor_index]
+    if accessor.get("type") != "VEC2" or accessor.get("componentType") != 5126 or "bufferView" not in accessor:
+        return binary
+    views = document.get("bufferViews", [])
+    view_index = accessor["bufferView"]
+    if not (0 <= view_index < len(views)):
+        return binary
+    view = views[view_index]
+    stride = int(view.get("byteStride", 8))
+    if stride < 8:
+        return binary
+    start = int(view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+    writable = bytearray(binary)
+    for index in range(int(accessor.get("count", 0))):
+        offset = start + index * stride
+        if offset + 4 > len(writable):
+            return binary
+        value = struct.unpack_from("<f", writable, offset)[0]
+        struct.pack_into("<f", writable, offset, value / columns)
+    visited.add(accessor_index)
+    return bytes(writable)
 
 
 def _prune_unreferenced_images(document: dict[str, Any]) -> None:
@@ -213,6 +292,8 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
     document, binary = _read_glb(glb)
     material_targets = {str(material.get("name", "")).lower(): material for material in document.get("materials", [])}
     ordered_indices = _primitive_material_order(document)
+    material_indices = {id(material): index for index, material in enumerate(document.get("materials", []))}
+    udim_columns_by_material: dict[int, int] = {}
     changed = 0
     slots = entry.get("materials", [])
     for slot_index, slot in enumerate(slots):
@@ -243,6 +324,10 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             role = str(texture.get("role", ""))
             if role in ("albedo", "packed", "normal", "emission") and role not in role_textures:
                 role_textures[role], binary = _embedded_texture(document, binary, texture_file)
+                columns = _udim_columns(texture_file)
+                if columns > 1:
+                    for material in targets:
+                        udim_columns_by_material[material_indices[id(material)]] = columns
         for material in targets:
             pbr = material.setdefault("pbrMetallicRoughness", {})
             if "albedo" in role_textures:
@@ -257,9 +342,16 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             if role_textures:
                 changed += 1
     if changed:
+        remapped: set[int] = set()
+        for mesh in document.get("meshes", []):
+            for primitive in mesh.get("primitives", []):
+                columns = udim_columns_by_material.get(primitive.get("material"), 1)
+                accessor = primitive.get("attributes", {}).get("TEXCOORD_0")
+                if isinstance(accessor, int):
+                    binary = _scale_accessor_u(document, binary, accessor, columns, remapped)
         _prune_unreferenced_images(document)
         _write_glb(glb, document, binary)
-    return {"asset": entry.get("asset"), "status": "bound" if changed else "no_matching_material", "materials": changed}
+    return {"asset": entry.get("asset"), "status": "bound" if changed else "no_matching_material", "materials": changed, "udim_accessors_remapped": len(remapped)}
 
 
 def binding_entries_from_reports(output: Path) -> dict[str, dict[str, Any]]:
@@ -409,7 +501,24 @@ def run(arguments: argparse.Namespace) -> int:
             texture_resize.extend(shrink_texture_files(output, arguments.max_texture_size, [str(item.get("output", "")) for item in report.get("textures", [])]))
     for entry in entries.values():
         entry["output_root"] = str(output)
+    udim_results: list[dict[str, Any]] = []
+    if arguments.textures:
+        binding_entries = binding_entries_from_reports(output)
+        output_paths = {
+            str(texture.get("output", ""))
+            for entry in binding_entries.values()
+            for slot in entry.get("materials", [])
+            for texture in slot.get("textures", [])
+            if texture.get("output")
+        }
+        for relative in sorted(output_paths):
+            result = prepare_udim_atlas(output / relative, arguments.max_texture_size)
+            if result is not None:
+                result["output"] = relative
+                udim_results.append(result)
     manifest = make_manifest(requested, entries, list(texture_entries.values()), exit_codes, arguments.batch_size, arguments.textures, texture_resize)
+    if udim_results:
+        manifest["texture_udim"] = udim_results
     if arguments.textures:
         # NullRHI cannot compile/bake many MaterialInstance graphs. Bind their
         # raw source PNGs after geometry export instead, so the normal export
