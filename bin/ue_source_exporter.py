@@ -294,6 +294,7 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
     ordered_indices = _primitive_material_order(document)
     material_indices = {id(material): index for index, material in enumerate(document.get("materials", []))}
     udim_columns_by_material: dict[int, int] = {}
+    remapped: set[int] = set()
     changed = 0
     slots = entry.get("materials", [])
     for slot_index, slot in enumerate(slots):
@@ -342,7 +343,6 @@ def bind_asset_textures(output: Path, entry: dict[str, Any]) -> dict[str, Any]:
             if role_textures:
                 changed += 1
     if changed:
-        remapped: set[int] = set()
         for mesh in document.get("meshes", []):
             for primitive in mesh.get("primitives", []):
                 columns = udim_columns_by_material.get(primitive.get("material"), 1)
